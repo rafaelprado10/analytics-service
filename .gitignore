@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.env.*
+.venv
+venv/
+ENV/
+env/
+pip-wheel-metadata/
