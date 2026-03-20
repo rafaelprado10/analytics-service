@@ -209,10 +209,10 @@ jobs:
           fi
 
           IMAGE_PREFIX="${ECR_REGISTRY}/${ECR_REPOSITORY}:"
-          if ! rg -n "image:\\s*${ECR_REGISTRY}/${ECR_REPOSITORY}:" "${MANIFEST_PATH}" >/dev/null; then
+          if ! grep -En "image:[[:space:]]*${ECR_REGISTRY}/${ECR_REPOSITORY}:" "${MANIFEST_PATH}" >/dev/null; then
             echo "Manifest image does not match expected prefix: ${IMAGE_PREFIX}"
             echo "Current image line(s):"
-            rg -n "image:" "${MANIFEST_PATH}" || true
+            grep -En "image:" "${MANIFEST_PATH}" || true
             exit 1
           fi
 
