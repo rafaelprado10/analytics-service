@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-service
+  namespace: analytics-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analytics-service
+  template:
+    metadata:
+      labels:
+        app: analytics-service
+    spec:
+      containers:
+        - name: analytics-service
+          image: xxxxxxxxxxxxxxxxxxx.dkr.ecr.us-east-1.amazonaws.com/analytics-service/analytics-service:1.0.0
+          ports:
+            - containerPort: 8005
+              name: http
+          env:
+            - name: AWS_DYNAMODB_TABLE
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_DYNAMODB_TABLE
+            
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: PORT
+          
+            - name: AWS_SQS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_SQS_URL
+
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: analytics-service-config
+                  key: AWS_REGION
+
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-service-secrets
+                  key: AWS_ACCESS_KEY_ID
+
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: analytics-service-secrets
+                  key: AWS_SECRET_ACCESS_KEY
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
