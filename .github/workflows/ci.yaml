@@ -124,6 +124,7 @@ jobs:
     outputs:
       image_tag: ${{ steps.image.outputs.tag }}
     env:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       AWS_REGION: ${{ secrets.AWS_REGION }}
       ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
@@ -137,6 +138,18 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate AWS account and ECR settings
+        run: |
+          if [ -z "${AWS_ACCOUNT_ID}" ] || [ -z "${AWS_REGION}" ] || [ -z "${ECR_REPOSITORY}" ]; then
+            echo "Missing required secrets: AWS_ACCOUNT_ID, AWS_REGION, or ECR_REPOSITORY"
+            exit 1
+          fi
+          CALLER_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "${CALLER_ACCOUNT}" != "${AWS_ACCOUNT_ID}" ]; then
+            echo "OIDC role authenticated in account ${CALLER_ACCOUNT}, but AWS_ACCOUNT_ID secret is ${AWS_ACCOUNT_ID}"
+            exit 1
+          fi
 
       - name: Log in to AWS ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -192,6 +205,14 @@ jobs:
 
           if [ ! -f "${MANIFEST_PATH}" ]; then
             echo "Manifest file not found. Expected k8s/deployment.yaml or deployment.yaml"
+            exit 1
+          fi
+
+          IMAGE_PREFIX="${ECR_REGISTRY}/${ECR_REPOSITORY}:"
+          if ! rg -n "image:\\s*${ECR_REGISTRY}/${ECR_REPOSITORY}:" "${MANIFEST_PATH}" >/dev/null; then
+            echo "Manifest image does not match expected prefix: ${IMAGE_PREFIX}"
+            echo "Current image line(s):"
+            rg -n "image:" "${MANIFEST_PATH}" || true
             exit 1
           fi
 
