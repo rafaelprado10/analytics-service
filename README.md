@@ -54,6 +54,15 @@ AWS_DYNAMODB_TABLE="ToggleMasterAnalytics"
 
 # Região dos seus serviços SQS e DynamoDB
 AWS_REGION="us-east-1"
+
+# --- OpenTelemetry (opcional, habilitado por padrão) ---
+# Use false para desabilitar totalmente a instrumentação
+OTEL_ENABLED="true"
+# Nome e versão do serviço reportados nos traces
+OTEL_SERVICE_NAME="analytics-service"
+OTEL_SERVICE_VERSION="1.0.0"
+# Endpoint OTLP HTTP do collector
+OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
 ```
 
 **3. Instale as Dependências:**
@@ -66,6 +75,14 @@ pip install -r requirements.txt
 gunicorn --bind 0.0.0.0:8005 app:app
 ```
 O servidor estará rodando em `http://localhost:8005`. Você verá logs no terminal assim que o worker SQS iniciar e (eventualmente) processar mensagens.
+
+## 🔭 OpenTelemetry
+
+Este serviço agora cria spans automaticamente para:
+- requisições HTTP do Flask (`/health`);
+- chamadas AWS via `boto3`/`botocore` (SQS e DynamoDB).
+
+Por padrão, os traces são exportados usando OTLP HTTP para o endpoint definido em `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
 ## 🧪 Testando o Serviço
 
