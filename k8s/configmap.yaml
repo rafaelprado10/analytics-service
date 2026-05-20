@@ -8,3 +8,7 @@ data:
   AWS_DYNAMODB_TABLE: ToggleMasterAnalytics
   AWS_SQS_URL: "https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxxxxxxxxxxxx/evaluation-queue"
   AWS_REGION: "us-east-1"
+  OTEL_ENABLED: "true"
+  OTEL_SERVICE_NAME: "analytics-service"
+  OTEL_SERVICE_VERSION: "1.0.0"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"

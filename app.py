@@ -5,148 +5,231 @@ import json
 import uuid
 import time
 import logging
+from contextvars import ContextVar
+from datetime import datetime
+
 import boto3
 from botocore.exceptions import NoCredentialsError, ClientError
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify, g
 from dotenv import load_dotenv
+from opentelemetry import trace
 
-# Configura o logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+from telemetry import setup_telemetry, instrument_flask, get_tracer
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-# Carrega .env para desenvolvimento local
+SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "analytics-service")
+_worker_message_id: ContextVar[str] = ContextVar("worker_message_id", default="-")
+_worker_trace_id: ContextVar[str] = ContextVar("worker_trace_id", default="-")
+
+
+def _request_context():
+    try:
+        return (
+            g.message_id,
+            getattr(g, "trace_id", "-"),
+            datetime.now().isoformat(),
+        )
+    except RuntimeError:
+        return (
+            _worker_message_id.get(),
+            _worker_trace_id.get(),
+            datetime.now().isoformat(),
+        )
+
+
+def _log_line(message: str, level: str = "info") -> None:
+    msg_id, trace_id, ts = _request_context()
+    line = f" {ts} | {msg_id} | {trace_id} | {SERVICE_NAME} | {message}"
+    getattr(log, level)(line)
+
+
+def log_info(message: str) -> None:
+    _log_line(message, "info")
+
+
+def log_warning(message: str) -> None:
+    _log_line(message, "warning")
+
+
+def log_error(message: str) -> None:
+    _log_line(message, "error")
+
+
+def log_critical(message: str) -> None:
+    _log_line(message, "critical")
+
+
 load_dotenv()
+setup_telemetry()
 
-# --- Configuração ---
 AWS_REGION = os.getenv("AWS_REGION")
 SQS_QUEUE_URL = os.getenv("AWS_SQS_URL")
 DYNAMODB_TABLE_NAME = os.getenv("AWS_DYNAMODB_TABLE")
 
 if not all([AWS_REGION, SQS_QUEUE_URL, DYNAMODB_TABLE_NAME]):
-    log.critical(
-        "Erro: AWS_REGION, AWS_SQS_URL, e AWS_DYNAMODB_TABLE",
-        "devem ser definidos."
+    log_critical(
+        "AWS_REGION, AWS_SQS_URL e AWS_DYNAMODB_TABLE devem ser definidos"
     )
     sys.exit(1)
 
-# --- Clientes Boto3 ---
-# Criamos a sessão uma vez
 try:
     session = boto3.Session(region_name=AWS_REGION)
     sqs_client = session.client("sqs")
     dynamodb_client = session.client("dynamodb")
-    log.info(f"Clientes Boto3 inicializados na região {AWS_REGION}")
+    log_info(f"Clientes Boto3 inicializados | region={AWS_REGION}")
 except NoCredentialsError:
-    log.critical("Credenciais da AWS não encontradas. Verifique seu ambiente.")
+    log_critical("Credenciais AWS não encontradas")
     sys.exit(1)
 except Exception as e:
-    log.critical(f"Erro ao inicializar o Boto3: {e}")
+    log_critical(f"Erro ao inicializar Boto3: {e}")
     sys.exit(1)
 
-
-# --- SQS Worker ---
+tracer = get_tracer()
 
 
 def process_message(message):
-    """Processa uma única mensagem SQS e a insere no DynamoDB"""
-    try:
-        log.info(f"Processando mensagem ID: {message['MessageId']}")
-        body = json.loads(message["Body"])
+    sqs_id = message["MessageId"]
+    token_mid = _worker_message_id.set(sqs_id)
 
-        # Gera um ID único para o item no DynamoDB
-        event_id = str(uuid.uuid4())
-
-        # Constrói o item no formato do DynamoDB
-        item = {
-            "event_id": {"S": event_id},
-            "user_id": {"S": body["user_id"]},
-            "flag_name": {"S": body["flag_name"]},
-            "result": {"BOOL": body["result"]},
-            "timestamp": {"S": body["timestamp"]},
-        }
-
-        # Insere no DynamoDB
-        dynamodb_client.put_item(TableName=DYNAMODB_TABLE_NAME, Item=item)
-
-        log.info(
-            f"Evento {event_id}",
-            f"(Flag: {body['flag_name']}) salvo no DynamoDB."
+    with tracer.start_as_current_span("sqs.process_message") as span:
+        span_ctx = span.get_span_context()
+        trace_id = (
+            format(span_ctx.trace_id, "032x") if span_ctx.trace_id else "-"
         )
+        token_tid = _worker_trace_id.set(trace_id)
+        span.set_attribute("messaging.message_id", sqs_id)
 
-        # Se tudo deu certo, deleta a mensagem da fila
-        sqs_client.delete_message(
-            QueueUrl=SQS_QUEUE_URL, ReceiptHandle=message["ReceiptHandle"]
-        )
+        try:
+            log_info(f"SQS worker | processando mensagem | sqs_message_id={sqs_id}")
+            body = json.loads(message["Body"])
 
-    except json.JSONDecodeError:
-        log.error("Erro ao decodificar JSON da mensagem ID:",
-                  message['MessageId'])
-        # Não deleta a mensagem, pode ser uma "poison pill"
-    except ClientError as e:
-        log.error(
-            "Erro do Boto3 (DynamoDB ou SQS)",
-            f"ao processar {message['MessageId']}: {e}"
-        )
-        # Não deleta a mensagem, tenta novamente
-    except Exception as e:
-        log.error(f"Erro inesperado ao processar {message['MessageId']}: {e}")
-        # Não deleta a mensagem, tenta novamente
+            event_id = str(uuid.uuid4())
+            flag_name = body.get("flag_name", "")
+            span.set_attribute("analytics.event_id", event_id)
+            span.set_attribute("flag.name", flag_name)
+
+            item = {
+                "event_id": {"S": event_id},
+                "user_id": {"S": body["user_id"]},
+                "flag_name": {"S": flag_name},
+                "result": {"BOOL": body["result"]},
+                "timestamp": {"S": body["timestamp"]},
+            }
+
+            log_info(
+                f"SQS worker | PutItem DynamoDB | table={DYNAMODB_TABLE_NAME} | "
+                f"event_id={event_id}"
+            )
+            dynamodb_client.put_item(TableName=DYNAMODB_TABLE_NAME, Item=item)
+
+            sqs_client.delete_message(
+                QueueUrl=SQS_QUEUE_URL,
+                ReceiptHandle=message["ReceiptHandle"],
+            )
+            log_info(
+                f"SQS worker | evento salvo e mensagem removida da fila | "
+                f"event_id={event_id} | flag_name={flag_name}"
+            )
+
+        except json.JSONDecodeError:
+            span.set_attribute("error", True)
+            log_error(
+                f"SQS worker | JSON inválido | sqs_message_id={sqs_id}"
+            )
+        except ClientError as e:
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", str(e))
+            log_error(
+                f"SQS worker | erro Boto3 | sqs_message_id={sqs_id}: {e}"
+            )
+        except Exception as e:
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", str(e))
+            log_error(
+                f"SQS worker | erro inesperado | sqs_message_id={sqs_id}: {e}"
+            )
+        finally:
+            _worker_trace_id.reset(token_tid)
+
+    _worker_message_id.reset(token_mid)
 
 
 def sqs_worker_loop():
-    """Loop principal do worker que ouve a fila SQS"""
-    log.info("Iniciando o worker SQS...")
+    log_info("SQS worker | iniciando loop de consumo")
     while True:
         try:
-            # Long-polling: espera até 20s por mensagens
+            log_info("SQS worker | aguardando mensagens (long poll 20s)")
             response = sqs_client.receive_message(
                 QueueUrl=SQS_QUEUE_URL,
-                MaxNumberOfMessages=10,  # Processa em lotes de até 10
+                MaxNumberOfMessages=10,
                 WaitTimeSeconds=20,
             )
 
             messages = response.get("Messages", [])
             if not messages:
-                # Nenhuma mensagem, continua o loop
                 continue
 
-            log.info(f"Recebidas {len(messages)} mensagens.")
-
+            log_info(f"SQS worker | recebidas {len(messages)} mensagens")
             for message in messages:
                 process_message(message)
 
         except ClientError as e:
-            log.error(f"Erro do Boto3 no loop principal do SQS: {e}")
-            time.sleep(10)  # Pausa antes de tentar novamente
+            log_error(f"SQS worker | erro Boto3 no loop principal: {e}")
+            time.sleep(10)
         except Exception as e:
-            log.error(f"Erro inesperado no loop principal do SQS: {e}")
+            log_error(f"SQS worker | erro inesperado no loop principal: {e}")
             time.sleep(10)
 
-
-# --- Servidor Flask (Apenas para Health Check) ---
 
 app = Flask(__name__)
 
 
+@app.before_request
+def create_request_context():
+    incoming_request_id = request.headers.get("X-Request-ID")
+    g.message_id = incoming_request_id or str(uuid.uuid4())
+    g.start_time = datetime.now()
+
+    span = trace.get_current_span()
+    span_ctx = span.get_span_context()
+    g.trace_id = (
+        format(span_ctx.trace_id, "032x") if span_ctx.trace_id else "-"
+    )
+
+    log_info(f"{request.method} {request.path} | início da requisição")
+
+
+@app.after_request
+def add_response_headers(response):
+    response.headers["X-Request-ID"] = g.message_id
+    elapsed_ms = int(
+        (datetime.now() - g.start_time).total_seconds() * 1000
+    )
+    log_info(
+        f"{request.method} {request.path} | status={response.status_code} | "
+        f"elapsed_ms={elapsed_ms}"
+    )
+    return response
+
+
+instrument_flask(app)
+
+
 @app.route("/health")
 def health():
-    # Uma verificação de saúde real poderia checar a conexão com o DynamoDB/SQS
+    log_info("GET /health | health check")
     return jsonify({"status": "ok"})
 
 
-# --- Inicialização ---
-
-
 def start_worker():
-    """Inicia o worker SQS em uma thread separada"""
     worker_thread = threading.Thread(target=sqs_worker_loop, daemon=True)
     worker_thread.start()
+    log_info("SQS worker | thread de background iniciada")
 
 
-# Inicia o worker SQS em uma thread de background
-# Isso garante que ele inicie tanto com 'flask run' quanto com 'gunicorn'
 start_worker()
 
 if __name__ == "__main__":
